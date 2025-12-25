@@ -1,58 +1,111 @@
-# main_final_fixed.py - Исправлено масштабирование
+import torch
+import sys
 import cv2
 import numpy as np
+import argparse
 import os
-import sys
 import time
-from collections import defaultdict, deque
+import signal
 
-class YOLOv3Detector:
-    def __init__(self, conf_thresh=0.5):
-        self.weights = "data/yolov3.weights"
-        self.config = "data/yolov3.cfg"
-        self.names = "data/coco.names"
+# Импортируем оригинальный трекер из sort.py
+from sort import Sort
+
+# ==================== ФУНКЦИЯ ДЛЯ ЦВЕТОВ ====================
+def get_color(obj_id, alpha=1.0):
+    """
+    Генерация цветов на основе ID объекта
+    Используем детерминированный подход для постоянства цветов
+    """
+    np.random.seed(int(obj_id) % 32)
+    color = np.random.rand(3) * 255
+    return tuple([int(c * alpha) for c in color])
+
+# ==================== ФУНКЦИЯ ДЛЯ ПРОВЕРКИ ОКНА ====================
+def is_window_closed(window_name):
+    """
+    Проверяет, закрыто ли окно OpenCV
+    Возвращает True если окно закрыто
+    """
+    try:
+        # Для OpenCV 4.x и 3.x
+        return cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1
+    except cv2.error:
+        # Если окно уже уничтожено
+        return True
+    except AttributeError:
+        # Для старых версий OpenCV
+        try:
+            return cv2.getWindowProperty(window_name, 0) < 0
+        except:
+            return True
+
+# ==================== ОБРАБОТЧИК СИГНАЛОВ ====================
+def signal_handler(sig, frame):
+    """Обработчик Ctrl+C для graceful shutdown"""
+    print('\n\nПолучен сигнал Ctrl+C, завершение работы...')
+    sys.exit(0)
+
+# ==================== МОДЕЛЬ YOLOv3 ====================
+class YOLOv3Model:
+    """Обертка для YOLOv3 в стиле PyTorch модели"""
+    def __init__(self, config_path="data/yolov3.cfg", 
+                 weights_path="data/yolov3.weights",
+                 classes_path="data/coco.names"):
         
-        if not os.path.exists(self.weights):
-            print("❌ Скачайте yolov3.weights в папку 'data/'")
-            print("Ссылка: https://pjreddie.com/media/files/yolov3.weights")
-            sys.exit(1)
-        
-        with open(self.names, 'r') as f:
+        # Загружаем классы COCO
+        with open(classes_path, 'r') as f:
             self.classes = [line.strip() for line in f.readlines()]
         
-        print("Загрузка YOLOv3...")
-        self.net = cv2.dnn.readNet(self.weights, self.config)
+        # Загружаем модель YOLOv3 через OpenCV DNN
+        self.net = cv2.dnn.readNetFromDarknet(config_path, weights_path)
         self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
         self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
         
+        # Получаем выходные слои
         layer_names = self.net.getLayerNames()
         self.output_layers = [layer_names[i - 1] for i in self.net.getUnconnectedOutLayers()]
         
-        self.conf_thresh = conf_thresh
-        print(f"✓ YOLOv3 загружен ({len(self.classes)} классов)")
+        # Параметры модели
+        self.conf = 0.5  # Порог уверенности
+        self.iou = 0.4   # IoU для NMS
+        self.names = {i: name for i, name in enumerate(self.classes)}
+        
+        print(f"✓ YOLOv3 модель загружена ({len(self.classes)} классов)")
     
-    def detect(self, frame, original_size):
+    def to(self, device):
+        """Для совместимости с PyTorch API"""
+        print(f"Модель на устройстве: {device}")
+        return self
+    
+    def eval(self):
+        """Режим оценки"""
+        return self
+    
+    def __call__(self, image):
         """
-        Детектирует объекты на кадре
-        original_size: (ширина, высота) оригинального кадра
+        Выполняет детекцию объектов
+        Возвращает детекции в формате [[x1, y1, x2, y2, conf, cls], ...]
         """
-        height, width = frame.shape[:2]
-        orig_width, orig_height = original_size
+        height, width = image.shape[:2]
         
-        # Запоминаем масштаб
-        scale_x = orig_width / width
-        scale_y = orig_height / height
-        
-        # Подготовка для YOLO
+        # Создаем blob для YOLOv3
         blob = cv2.dnn.blobFromImage(
-            frame, 1/255.0, (416, 416), 
-            (0, 0, 0), swapRB=True, crop=False
+            image, 
+            1/255.0,           # Масштабирование
+            (416, 416),        # Размер для YOLOv3
+            (0, 0, 0),         # Средние значения
+            swapRB=True,       # Уже в RGB
+            crop=False
         )
         
+        # Пропускаем через сеть
         self.net.setInput(blob)
         outputs = self.net.forward(self.output_layers)
         
-        boxes, confidences, class_ids = [], [], []
+        # Обрабатываем результаты
+        boxes = []
+        confidences = []
+        class_ids = []
         
         for output in outputs:
             for detection in output:
@@ -60,8 +113,8 @@ class YOLOv3Detector:
                 class_id = np.argmax(scores)
                 confidence = scores[class_id]
                 
-                if confidence > self.conf_thresh:
-                    # Координаты относительно уменьшенного изображения
+                if confidence > self.conf:
+                    # Координаты bounding box
                     center_x = int(detection[0] * width)
                     center_y = int(detection[1] * height)
                     w = int(detection[2] * width)
@@ -74,442 +127,560 @@ class YOLOv3Detector:
                     confidences.append(float(confidence))
                     class_ids.append(class_id)
         
-        # NMS
-        indices = cv2.dnn.NMSBoxes(boxes, confidences, self.conf_thresh, 0.4)
+        # Non-Maximum Suppression
+        indices = cv2.dnn.NMSBoxes(boxes, confidences, self.conf, self.iou)
         
-        detections = []
+        # Формируем результат в нужном формате для SORT
+        results_list = []
         if len(indices) > 0:
             for i in indices.flatten():
                 x, y, w, h = boxes[i]
-                
-                # МАСШТАБИРУЕМ координаты к оригинальному размеру!
-                x = int(x * scale_x)
-                y = int(y * scale_y)
-                w = int(w * scale_x)
-                h = int(h * scale_y)
-                
-                detections.append({
-                    'bbox': [x, y, x + w, y + h],
-                    'confidence': confidences[i],
-                    'class_id': class_ids[i],
-                    'class_name': self.classes[class_ids[i]]
-                })
+                conf = confidences[i]
+                cls = class_ids[i]
+                # Формат для SORT: [x1, y1, x2, y2, score, class]
+                results_list.append([x, y, x + w, y + h, conf, cls])
         
-        return detections
+        # Создаем объект Results (для совместимости)
+        class Results:
+            def __init__(self, pred, image):
+                self.pred = pred  # Список тензоров
+                self.ims = [image]  # Список изображений
+        
+        # Конвертируем в тензоры PyTorch
+        if results_list:
+            pred_tensor = torch.tensor(results_list)
+        else:
+            pred_tensor = torch.zeros((0, 6))
+        
+        return Results([pred_tensor], image)
 
-class SimpleTracker:
-    def __init__(self, max_age=30, iou_threshold=0.3):
-        self.tracks = {}
-        self.next_id = 1
-        self.max_age = max_age
-        self.iou_threshold = iou_threshold
-        
-    def update(self, detections):
-        if not detections:
-            for track_id in list(self.tracks.keys()):
-                self.tracks[track_id]['age'] += 1
-                if self.tracks[track_id]['age'] > self.max_age:
-                    del self.tracks[track_id]
-            return []
-        
-        results = []
-        used_detections = set()
-        
-        # Сначала ищем соответствия для существующих треков
-        for track_id, track in self.tracks.items():
-            best_iou = self.iou_threshold
-            best_det_idx = -1
-            
-            for i, det in enumerate(detections):
-                if i in used_detections:
-                    continue
-                
-                iou = self.calculate_iou(track['bbox'], det['bbox'])
-                if iou > best_iou:
-                    best_iou = iou
-                    best_det_idx = i
-            
-            if best_det_idx != -1:
-                det = detections[best_det_idx]
-                self.tracks[track_id]['bbox'] = det['bbox']
-                self.tracks[track_id]['age'] = 0
-                self.tracks[track_id]['class_name'] = det['class_name']
-                used_detections.add(best_det_idx)
-                
-                results.append({
-                    'track_id': track_id,
-                    'bbox': det['bbox'],
-                    'class_name': det['class_name'],
-                    'confidence': det['confidence']
-                })
-            else:
-                track['age'] += 1
-                if track['age'] <= self.max_age:
-                    results.append({
-                        'track_id': track_id,
-                        'bbox': track['bbox'],
-                        'class_name': track['class_name'],
-                        'confidence': 0.5
-                    })
-                else:
-                    del self.tracks[track_id]
-        
-        # Новые треки
-        for i, det in enumerate(detections):
-            if i not in used_detections:
-                track_id = self.next_id
-                self.next_id += 1
-                
-                self.tracks[track_id] = {
-                    'bbox': det['bbox'],
-                    'age': 0,
-                    'class_name': det['class_name']
-                }
-                
-                results.append({
-                    'track_id': track_id,
-                    'bbox': det['bbox'],
-                    'class_name': det['class_name'],
-                    'confidence': det['confidence']
-                })
-        
-        return results
+# ==================== КЛАСС ДЛЯ УПРАВЛЕНИЯ ТРАЕКТОРИЯМИ ====================
+class TrajectoryManager:
+    """Управляет треками и их траекториями для отрисовки шлейфа"""
+    def __init__(self, max_history=50, fade_frames=30):
+        """
+        Args:
+            max_history: максимальная длина траектории в кадрах
+            fade_frames: количество кадров для полного исчезновения неактивных траекторий
+        """
+        self.trajectories = {}  # track_id -> {'points': [(x, y), ...], 'active': bool, 'inactive_frames': int}
+        self.max_history = max_history
+        self.fade_frames = fade_frames
     
-    def calculate_iou(self, box1, box2):
-        x1 = max(box1[0], box2[0])
-        y1 = max(box1[1], box2[1])
-        x2 = min(box1[2], box2[2])
-        y2 = min(box1[3], box2[3])
+    def update(self, trackers):
+        """
+        Обновляет траектории на основе текущих треков
+        trackers: массив от SORT [[x1, y1, x2, y2, track_id, cls], ...]
+        """
+        current_ids = set()
         
-        intersection = max(0, x2 - x1) * max(0, y2 - y1)
-        area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
-        area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+        # Отмечаем все существующие треки как неактивные
+        for track_id in self.trajectories:
+            self.trajectories[track_id]['active'] = False
         
-        return intersection / (area1 + area2 - intersection + 1e-6)
-
-class TrailDrawer:
-    def __init__(self, max_length=30):
-        self.trails = defaultdict(lambda: deque(maxlen=max_length))
-        self.colors = {}
-    
-    def update(self, tracks, frame_width, frame_height):
-        for track in tracks:
-            track_id = track['track_id']
-            bbox = track['bbox']
-            
-            # Центр bbox с проверкой границ
-            center_x = (bbox[0] + bbox[2]) / 2
-            center_y = (bbox[1] + bbox[3]) / 2
-            
-            # Ограничиваем координаты рамкой видео
-            center_x = max(0, min(center_x, frame_width))
-            center_y = max(0, min(center_y, frame_height))
-            
-            self.trails[track_id].append((center_x, center_y))
-            
-            if track_id not in self.colors:
-                np.random.seed(track_id)
-                self.colors[track_id] = (
-                    np.random.randint(50, 255),
-                    np.random.randint(50, 255),
-                    np.random.randint(50, 255)
-                )
-    
-    def draw(self, frame):
-        for track_id, points in self.trails.items():
-            if len(points) > 1:
-                color = self.colors[track_id]
-                
-                for i in range(1, len(points)):
-                    pt1 = (int(points[i-1][0]), int(points[i-1][1]))
-                    pt2 = (int(points[i][0]), int(points[i][1]))
+        if len(trackers) > 0:
+            for tracker in trackers:
+                if len(tracker) >= 6:
+                    x1, y1, x2, y2, track_id, cls = tracker[:6]
+                    track_id = int(track_id)
                     
-                    # Проверяем что точки в пределах кадра
-                    if (0 <= pt1[0] < frame.shape[1] and 0 <= pt1[1] < frame.shape[0] and
-                        0 <= pt2[0] < frame.shape[1] and 0 <= pt2[1] < frame.shape[0]):
-                        
-                        # Плавное уменьшение толщины
-                        alpha = i / len(points)
-                        thickness = max(2, int(4 * alpha))
-                        cv2.line(frame, pt1, pt2, color, thickness)
+                    # Вычисляем центр bounding box
+                    x_center = (x1 + x2) / 2
+                    y_center = (y1 + y2) / 2
+                    
+                    # Создаем новую запись или обновляем существующую
+                    if track_id not in self.trajectories:
+                        self.trajectories[track_id] = {
+                            'points': [],
+                            'active': True,
+                            'inactive_frames': 0,
+                            'class': cls
+                        }
+                    else:
+                        self.trajectories[track_id]['active'] = True
+                        self.trajectories[track_id]['inactive_frames'] = 0
+                    
+                    # Добавляем точку в траекторию
+                    self.trajectories[track_id]['points'].append((x_center, y_center))
+                    
+                    # Ограничиваем длину истории
+                    if len(self.trajectories[track_id]['points']) > self.max_history:
+                        self.trajectories[track_id]['points'].pop(0)
+                    
+                    current_ids.add(track_id)
         
-        return frame
+        # Увеличиваем счетчик неактивных кадров для треков, которые не обновились
+        for track_id in list(self.trajectories.keys()):
+            if not self.trajectories[track_id]['active']:
+                self.trajectories[track_id]['inactive_frames'] += 1
+        
+        # Удаляем очень старые треки (полностью исчезнувшие)
+        track_ids_to_remove = []
+        for track_id, data in self.trajectories.items():
+            if data['inactive_frames'] > self.fade_frames * 2:  # В 2 раза больше времени фейда
+                track_ids_to_remove.append(track_id)
+        
+        for track_id in track_ids_to_remove:
+            del self.trajectories[track_id]
+    
+    def draw_trajectories(self, image, thickness=2, max_points=50):
+        """Рисует шлейфы траекторий на изображении"""
+        for track_id, data in self.trajectories.items():
+            points = data['points']
+            inactive_frames = data['inactive_frames']
+            is_active = data['active']
+            
+            if len(points) < 2:
+                continue
+            
+            # Получаем цвет для этого трека
+            base_color = get_color(track_id, alpha=1.0)
+            
+            # Определяем прозрачность в зависимости от активности
+            if is_active:
+                alpha = 1.0  # Полностью видимый для активных
+            else:
+                # Плавное исчезновение для неактивных
+                alpha = max(0.1, 1.0 - (inactive_frames / self.fade_frames))
+            
+            # Применяем прозрачность к цвету
+            color = tuple([int(c * alpha) for c in base_color])
+            
+            # Берем только последние max_points точек
+            recent_points = points[-max_points:] if len(points) > max_points else points
+            
+            # Рисуем линии между точками
+            for i in range(1, len(recent_points)):
+                pt1 = (int(recent_points[i-1][0]), int(recent_points[i-1][1]))
+                pt2 = (int(recent_points[i][0]), int(recent_points[i][1]))
+                
+                # Пропускаем слишком далекие точки (возможно, ошибочные)
+                dist = np.sqrt((pt2[0] - pt1[0])**2 + (pt2[1] - pt1[1])**2)
+                if dist < 100:  # Максимальное расстояние между точками
+                    # Делаем сегменты дальше от текущей позиции более прозрачными
+                    segment_index = i / len(recent_points)
+                    if is_active:
+                        segment_alpha = 0.3 + 0.7 * segment_index
+                    else:
+                        segment_alpha = alpha * (0.3 + 0.7 * segment_index)
+                    
+                    segment_color = tuple([int(c * segment_alpha) for c in base_color])
+                    
+                    # Толщина линии зависит от активности
+                    segment_thickness = thickness if is_active else max(1, thickness - 1)
+                    
+                    cv2.line(image, pt1, pt2, segment_color, segment_thickness)
+            
+            # Рисуем последнюю точку (текущую позицию) для активных треков
+            if is_active and len(recent_points) > 0:
+                last_point = recent_points[-1]
+                cv2.circle(image, (int(last_point[0]), int(last_point[1])), 
+                           thickness + 2, color, -1)
+        
+        return image
+    
+    def get_active_count(self):
+        """Возвращает количество активных треков"""
+        return sum(1 for data in self.trajectories.values() if data['active'])
+    
+    def get_total_count(self):
+        """Возвращает общее количество треков (активных + неактивных)"""
+        return len(self.trajectories)
 
-def calculate_font_scale(frame_width):
-    """Адаптивный размер шрифта в зависимости от разрешения"""
-    if frame_width >= 3840:  # 4K
-        return 1.5
-    elif frame_width >= 1920:  # Full HD
-        return 1.0
-    elif frame_width >= 1280:  # HD
-        return 0.8
-    else:
-        return 0.6
-
+# ==================== ОСНОВНАЯ ФУНКЦИЯ ====================
 def main():
+    # Регистрация обработчика Ctrl+C
+    signal.signal(signal.SIGINT, signal_handler)
+    
+    # Парсинг аргументов командной строки
+    parser = argparse.ArgumentParser(description='YOLOv3 Object Detection with SORT Tracking')
+    
+    # 1. Устройство захвата (путь до видео, номер камеры, ip адрес)
+    parser.add_argument('--source', type=str, 
+                       default="C:\\Users\\admin\\Downloads\\car-traffic.mp4",
+                       help='Путь к видеофайлу, номер камеры (0, 1, ...) или IP-адрес')
+    
+    # 2. Порог срабатывания детектора
+    parser.add_argument('--conf-threshold', type=float, default=0.5,
+                       help='Порог уверенности детектора (0.0-1.0)')
+    
+    # 3. Время жизни объектов (когда трекер перестает быть активным)
+    parser.add_argument('--max-age', type=int, default=30,
+                       help='Максимальное количество кадров без обновления до удаления трека')
+    
+    # 4. Порог IoU для трекера
+    parser.add_argument('--iou-threshold', type=float, default=0.3,
+                       help='Порог IoU для ассоциации детекций с треками (0.0-1.0)')
+    
+    # Дополнительные параметры из оригинального SORT
+    parser.add_argument('--min-hits', type=int, default=3,
+                       help='Минимальное количество детекций для инициализации трека')
+    
+    # Флаги управления
+    parser.add_argument('--use-tracker', action='store_true', default=True,
+                       help='Использовать трекинг объектов')
+    parser.add_argument('--show-trajectories', action='store_true', default=True,
+                       help='Показывать шлейфы траекторий')
+    parser.add_argument('--trajectory-length', type=int, default=30,
+                       help='Длина отображаемого шлейфа траектории (в кадрах)')
+    
+    args = parser.parse_args()
+    
     print("=" * 70)
-    print("YOLOv3 ДЕТЕКТОР - ИСПРАВЛЕННОЕ МАСШТАБИРОВАНИЕ")
+    print("YOLOv3 Object Detection with SORT Multi-Object Tracking")
+    print("=" * 70)
+    print(f"Источник: {args.source}")
+    print(f"Порог детектора: {args.conf_threshold}")
+    print(f"Время жизни треков (max_age): {args.max_age} кадров")
+    print(f"Порог IoU: {args.iou_threshold}")
+    print(f"Минимальные попадания (min_hits): {args.min_hits}")
     print("=" * 70)
     
-    # Параметры
-    VIDEO_PATH = "C:\\Users\\admin\\Downloads\\car-traffic.mp4"
-    CONF_THRESHOLD = 0.5
-    MAX_AGE = 30
-    IOU_THRESHOLD = 0.3
-    SKIP_FRAMES = 2  # Пропускать 2 из 3 кадров для ускорения
+    # Инициализация устройства
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    print(f"Устройство: {device}")
     
-    if not os.path.exists(VIDEO_PATH):
-        print(f"❌ Видео не найдено: {VIDEO_PATH}")
+    # Загрузка модели YOLOv3
+    print("\nЗагрузка модели YOLOv3...")
+    try:
+        model = YOLOv3Model(
+            config_path="data/yolov3.cfg",
+            weights_path="data/yolov3.weights",
+            classes_path="data/coco.names"
+        )
+        model.conf = args.conf_threshold
+        model = model.to(device)
+        model.eval()
+    except Exception as e:
+        print(f"✗ Ошибка загрузки модели: {e}")
+        print("Убедитесь, что файлы YOLOv3 находятся в папке 'data/':")
+        print("  - yolov3.cfg")
+        print("  - yolov3.weights")
+        print("  - coco.names")
         return
     
-    # Инициализация
-    print("1. Загрузка детектора...")
-    detector = YOLOv3Detector(conf_thresh=CONF_THRESHOLD)
+    # Определяем тип источника
+    source = args.source
+    if source.isdigit():  # Номер камеры
+        source = int(source)
+        print(f"Используется камера #{source}")
+    elif source.startswith(('http://', 'https://', 'rtsp://', 'rtmp://')):
+        print(f"Используется IP-камера/поток: {source}")
+    else:
+        print(f"Используется видеофайл: {source}")
     
-    print("2. Инициализация трекера...")
-    tracker = SimpleTracker(max_age=MAX_AGE, iou_threshold=IOU_THRESHOLD)
-    trail_drawer = TrailDrawer(max_length=50)
-    
-    print("3. Открытие видео...")
-    cap = cv2.VideoCapture(VIDEO_PATH)
+    # Открытие видеофайла/камеры
+    cap = cv2.VideoCapture(source)
     
     if not cap.isOpened():
-        print("❌ Не удалось открыть видео")
+        print(f"Не удалось открыть источник: {args.source}")
         return
     
-    # Оригинальные параметры видео
-    orig_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    orig_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    # Получение параметров видео
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = cap.get(cv2.CAP_PROP_FPS)
+    print(f"\nПараметры источника:")
+    print(f"  Разрешение: {width}x{height}")
+    print(f"  FPS: {fps:.1f}")
     
-    print(f"   Оригинальный размер: {orig_width}x{orig_height}")
-    print(f"   Для обработки будет использоваться: 1280x720")
-    print(f"   FPS: {fps:.1f}")
-    print(f"   Порог уверенности: {CONF_THRESHOLD}")
-    print(f"   IoU порог: {IOU_THRESHOLD}")
-    print("-" * 70)
+    # Инициализация оригинального SORT трекера
+    mot_tracker = Sort(
+        max_age=args.max_age,
+        min_hits=args.min_hits,
+        iou_threshold=args.iou_threshold
+    )
     
-    # Размер для обработки (фиксированный для стабильности)
-    PROCESS_WIDTH = 1280
-    PROCESS_HEIGHT = 720
+    # Менеджер траекторий для отрисовки шлейфа
+    trajectory_manager = TrajectoryManager(max_history=args.trajectory_length)
     
-    # Окно для отображения
-    cv2.namedWindow('YOLOv3 Tracker', cv2.WINDOW_NORMAL)
-    display_width = min(1920, orig_width)
-    display_height = min(1080, orig_height)
-    cv2.resizeWindow('YOLOv3 Tracker', display_width, display_height)
+    use_tracker = args.use_tracker
+    show_trajectories = args.show_trajectories
     
-    # Для сохранения результата
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter('output_result.mp4', fourcc, fps, (orig_width, orig_height))
+    # Создание окна для отображения
+    window_name = 'YOLOv3 Object Tracking'
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_name, min(1280, width), min(720, height))
+    
+    print("\n" + "=" * 70)
+    print("УПРАВЛЕНИЕ:")
+    print("  'q' или ESC - выход")
+    print("  't' - вкл/выкл трекинг")
+    print("  'p' - вкл/выкл отображение траекторий")
+    print("  '+'/'-' - увеличить/уменьшить порог уверенности")
+    print("  's' - сохранить текущий кадр")
+    print("  ПРОБЕЛ - пауза/продолжить")
+    print("  Ctrl+C - аварийное завершение")
+    print("=" * 70 + "\n")
     
     frame_count = 0
-    processed_count = 0
-    start_time = time.time()
-    
-    print("4. Начинаю обработку...")
-    print("   Нажмите 'q' для выхода, 's' для сохранения кадра")
-    print("   Нажмите '+' для увеличения порога, '-' для уменьшения")
-    print("-" * 70)
-    
-    current_conf_threshold = CONF_THRESHOLD
+    total_fps = 0
+    running = True
     
     try:
-        while True:
+        while running:
+            # ПРОВЕРКА 1: Окно закрыто крестиком?
+            if is_window_closed(window_name):
+                print("\nОкно закрыто пользователем (крестик)")
+                running = False
+                break
+            
+            # ПРОВЕРКА 2: Чтение кадра
             ret, frame = cap.read()
             if not ret:
-                print("\n✅ Конец видео")
+                print("\nКонец видео или ошибка чтения кадра")
+                running = False
                 break
             
             frame_count += 1
             
-            # Пропуск кадров для ускорения
-            if frame_count % (SKIP_FRAMES + 1) != 0:
-                continue
+            # Конвертация BGR → RGB для модели
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             
-            processed_count += 1
+            # Измерение времени детекции
+            start_time = time.time()
             
-            # Сохраняем оригинальный кадр для отрисовки
-            original_frame = frame.copy()
+            # Детекция объектов
+            results = model(frame_rgb)
             
-            # Уменьшаем кадр для обработки
-            processed_frame = cv2.resize(frame, (PROCESS_WIDTH, PROCESS_HEIGHT))
+            # Получение предсказаний в формате numpy
+            preds = results.pred[0].detach().cpu().numpy()
             
-            # Детекция (передаем оригинальный размер для масштабирования)
-            detections = detector.detect(processed_frame, (orig_width, orig_height))
+            detection_time = time.time() - start_time
             
-            # Трекинг
-            tracks = tracker.update(detections)
-            
-            # Обновляем шлейфы с оригинальными размерами
-            trail_drawer.update(tracks, orig_width, orig_height)
-            
-            # Отрисовка на оригинальном кадре
-            display_frame = original_frame.copy()
-            
-            # 1. Рисуем шлейфы
-            display_frame = trail_drawer.draw(display_frame)
-            
-            # 2. Адаптивный размер шрифта
-            font_scale = calculate_font_scale(orig_width)
-            font_thickness = max(2, int(font_scale * 2))
-            
-            # 3. Рисуем bounding boxes
-            cars_count = 0
-            people_count = 0
-            other_count = 0
-            
-            for track in tracks:
-                x1, y1, x2, y2 = track['bbox']
-                x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+            # Трекинг с оригинальным SORT
+            tracking_time = 0
+            if use_tracker and len(preds) > 0:
+                # SORT ожидает формат: [[x1, y1, x2, y2, score, class], ...]
+                # Наши данные уже в этом формате
                 
-                # Ограничиваем координаты рамкой
-                x1 = max(0, x1)
-                y1 = max(0, y1)
-                x2 = min(orig_width - 1, x2)
-                y2 = min(orig_height - 1, y2)
+                start_track = time.time()
+                tracked_preds = mot_tracker.update(preds)
+                tracking_time = time.time() - start_track
                 
-                # Пропускаем если bbox слишком маленький или невалидный
-                if x2 <= x1 or y2 <= y1 or (x2 - x1) < 10 or (y2 - y1) < 10:
+                # SORT возвращает: [[x1, y1, x2, y2, track_id, class], ...]
+                # Конвертируем в наш формат: [[x1, y1, x2, y2, track_id, conf, class], ...]
+                results_list = []
+                if len(tracked_preds) > 0:
+                    for track in tracked_preds:
+                        x1, y1, x2, y2, track_id, cls = track[:6]
+                        # Находим confidence из оригинальных детекций (приблизительно)
+                        conf = 0.8  # Значение по умолчанию
+                        # Можно улучшить: найти ближайшую детекцию и взять её confidence
+                        results_list.append([x1, y1, x2, y2, track_id, conf, cls])
+                
+                preds = np.array(results_list) if results_list else np.zeros((0, 7))
+                
+                # Обновляем траектории для отрисовки шлейфа
+                if show_trajectories:
+                    trajectory_manager.update(tracked_preds)
+            else:
+                # Без трекера - просто форматируем данные
+                if len(preds) > 0:
+                    temp_preds = []
+                    for pred in preds:
+                        if len(pred) >= 6:
+                            # track_id = -1 означает отсутствие трекинга
+                            temp_preds.append([*pred[:6], -1])
+                    preds = np.array(temp_preds) if temp_preds else np.zeros((0, 7))
+                else:
+                    preds = np.zeros((0, 7))
+            
+            # Конвертация обратно в BGR для отображения
+            display_image = cv2.cvtColor(results.ims[0], cv2.COLOR_RGB2BGR)
+            
+            # Рисуем траектории (шлейфы)
+            if use_tracker and show_trajectories:
+                display_image = trajectory_manager.draw_trajectories(display_image, thickness=6)
+            
+            # Отрисовка bounding boxes
+            for pred in preds:
+                if len(pred) >= 7:
+                    # Формат с трекингом: [x1, y1, x2, y2, track_id, conf, cls]
+                    x1, y1, x2, y2, track_id, conf, cls = pred[:7]
+                    track_id = int(track_id)
+                    cls = int(cls)
+                elif len(pred) >= 6:
+                    # Формат без трекинга: [x1, y1, x2, y2, conf, cls]
+                    x1, y1, x2, y2, conf, cls = pred[:6]
+                    track_id = -1
+                    cls = int(cls)
+                else:
                     continue
                 
-                # Цвет по ID трека
-                track_id = track['track_id']
-                np.random.seed(track_id)
-                color = (
-                    np.random.randint(50, 255),
-                    np.random.randint(50, 255),
-                    np.random.randint(50, 255)
-                )
+                x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
                 
-                # Класс объекта
-                class_name = track['class_name']
+                # Проверка координат
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(width-1, x2), min(height-1, y2)
                 
-                # Счетчики
-                if class_name in ['car', 'bus', 'truck']:
-                    cars_count += 1
-                    box_color = (0, 0, 255)  # Красный для машин
-                elif class_name == 'person':
-                    people_count += 1
-                    box_color = (0, 255, 0)  # Зеленый для людей
-                elif class_name == 'motorcycle' or class_name == 'bicycle':
-                    other_count += 1
-                    box_color = (255, 0, 0)  # Синий для транспорта
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                
+                # Выбор цвета на основе track_id или class_id
+                if track_id >= 0:
+                    color_seed = track_id
                 else:
-                    other_count += 1
-                    box_color = color
+                    color_seed = cls
                 
-                # Толщина рамки адаптивная
-                box_thickness = max(2, int(3 * (orig_width / 1920)))
+                color = get_color(color_seed)
                 
-                # Рисуем bounding box
-                cv2.rectangle(display_frame, (x1, y1), (x2, y2), box_color, box_thickness)
+                # Имя класса
+                class_name = model.names.get(cls, f'class_{cls}')
                 
-                # Подпись с адаптивным размером
-                label = f"{class_name} ID:{track_id}"
+                # Отрисовка прямоугольника
+                cv2.rectangle(display_image, (x1, y1), (x2, y2), color, 2)
+                
+                # Подготовка текста
+                font_scale = 1.5
+                thickness = 3
+                
+                if use_tracker and track_id >= 0:
+                    label = f"ID:{track_id} {class_name}"
+                else:
+                    label = f"{class_name} {conf:.2f}"
                 
                 # Размер текста
-                (label_width, label_height), baseline = cv2.getTextSize(
-                    label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thickness
+                (label_w, label_h), baseline = cv2.getTextSize(
+                    label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness
                 )
                 
-                # Рисуем фон для текста
-                cv2.rectangle(display_frame,
-                            (x1, y1 - label_height - baseline - 5),
-                            (x1 + label_width, y1),
-                            box_color, -1)
+                # Позиция текста
+                text_y = max(y1, label_h + 5)
                 
-                # Рисуем текст
-                cv2.putText(display_frame, label,
-                          (x1, y1 - baseline - 2),
-                          cv2.FONT_HERSHEY_SIMPLEX, font_scale,
-                          (255, 255, 255), font_thickness)
+                # Фон для текста
+                cv2.rectangle(display_image,
+                             (x1, text_y - label_h - 5),
+                             (x1 + label_w, text_y + 5),
+                             color, -1)
+                
+                # Текст
+                cv2.putText(display_image, label, 
+                           (x1, text_y),
+                           cv2.FONT_HERSHEY_SIMPLEX, font_scale, 
+                           (255, 255, 255), thickness)
+                
+                # Для треков отображаем дополнительную информацию
+                if use_tracker and track_id >= 0:
+                    # Рисуем маленький кружок в центре объекта
+                    center_x = (x1 + x2) // 2
+                    center_y = (y1 + y2) // 2
+                    cv2.circle(display_image, (center_x, center_y), 3, (255, 255, 255), -1)
             
-            # 4. Панель статистики
-            elapsed = time.time() - start_time
-            current_fps = processed_count / elapsed if elapsed > 0 else 0
+            # Добавление информации на кадр
+            current_fps = 1.0 / (detection_time + tracking_time) if (detection_time + tracking_time) > 0 else 0
+            total_fps += current_fps
             
-            # Темный фон для статистики
-            stats_height = 130
-            cv2.rectangle(display_frame, (0, 0), (700, stats_height), (30, 30, 30), -1)
-            cv2.rectangle(display_frame, (0, 0), (700, stats_height), (0, 200, 0), 3)
+            # Панель информации
+            y_offset = 40
+            line_height = 40 #25
             
-            # Статистика
-            stats_lines = [
-                f"Видео: {os.path.basename(VIDEO_PATH)}",
-                f"Кадр: {frame_count} | Обработано: {processed_count}",
-                f"FPS: {current_fps:.1f}",
-                f"Машин: {cars_count} | Людей: {people_count} | Других: {other_count}",
-                f"Порог уверенности: {current_conf_threshold:.2f} (Используйте +/-)",
-                f"Max Age: {MAX_AGE} | IoU: {IOU_THRESHOLD}",
-                "Управление: 'q'-выход 's'-сохранить '+/-'-порог"
+            info_lines = [
+                f"Кадр: {frame_count} | Объекты: {len(preds)}",
+                f"Трекер: {'ВКЛ' if use_tracker else 'ВЫКЛ'} | Траектории: {'ВКЛ' if show_trajectories else 'ВЫКЛ'}",
+                f"Порог: {model.conf:.2f} | Треков: {len(trajectory_manager.trajectories)}",
+                f"Детекция: {detection_time*1000:.1f}мс | Трекинг: {tracking_time*1000:.1f}мс | FPS: {current_fps:.1f}"
             ]
             
-            # Адаптивный размер шрифта для статистики
-            stats_font_scale = max(0.5, min(0.8, 1920 / orig_width))
-            stats_thickness = max(1, int(stats_font_scale * 2))
+            for i, line in enumerate(info_lines):
+                cv2.putText(display_image, line, (30, y_offset + i * line_height),
+                           cv2.FONT_HERSHEY_COMPLEX, 1.5, (0, 255, 0), 2)
             
-            for i, line in enumerate(stats_lines):
-                y_pos = 25 + i * 20
-                cv2.putText(display_frame, line, (10, y_pos),
-                           cv2.FONT_HERSHEY_SIMPLEX, stats_font_scale,
-                           (220, 255, 220), stats_thickness)
+            # Отображение изображения
+            cv2.imshow(window_name, display_image)
             
-            # 5. Информация о масштабе (в правом нижнем углу)
-            scale_info = f"Масштаб: 1:{orig_width//PROCESS_WIDTH}"
-            cv2.putText(display_frame, scale_info, 
-                       (orig_width - 250, orig_height - 20),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 100), 2)
+            # ПРОВЕРКА 3: Обработка клавиш (30 мс для лучшей обработки событий окна)
+            key = cv2.waitKey(30) & 0xFF
             
-            # Сохраняем результат
-            out.write(display_frame)
-            
-            # Показываем (уменьшаем для отображения если нужно)
-            if orig_width > 1920 or orig_height > 1080:
-                display_resized = cv2.resize(display_frame, (display_width, display_height))
-                cv2.imshow('YOLOv3 Tracker', display_resized)
-            else:
-                cv2.imshow('YOLOv3 Tracker', display_frame)
-            
-            # Управление
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
-                print("\n⚠️  Остановлено пользователем")
+            if key == ord('q') or key == 27:  # 'q' или ESC
+                print("\nОстановлено пользователем (клавиша q/ESC)")
+                running = False
                 break
-            elif key == ord('s'):
-                filename = f"detection_frame_{frame_count}.jpg"
-                cv2.imwrite(filename, display_frame)
-                print(f"\n📸 Сохранен кадр: {filename}")
-            elif key == ord('+'):
-                current_conf_threshold = min(0.9, current_conf_threshold + 0.05)
-                detector.conf_thresh = current_conf_threshold
-                print(f"\n🔺 Порог увеличен: {current_conf_threshold:.2f}")
-            elif key == ord('-'):
-                current_conf_threshold = max(0.1, current_conf_threshold - 0.05)
-                detector.conf_thresh = current_conf_threshold
-                print(f"\n🔻 Порог уменьшен: {current_conf_threshold:.2f}")
+            elif key == ord('t'):  # Переключение трекера
+                use_tracker = not use_tracker
+                if use_tracker:
+                    # Создаем новый трекер с текущими параметрами
+                    mot_tracker = Sort(
+                        max_age=args.max_age,
+                        min_hits=args.min_hits,
+                        iou_threshold=args.iou_threshold
+                    )
+                    trajectory_manager = TrajectoryManager(max_history=args.trajectory_length)
+                    print(f"\nТрекер: ВКЛЮЧЕН (max_age={args.max_age}, iou={args.iou_threshold})")
+                else:
+                    print(f"\nТрекер: ВЫКЛЮЧЕН")
+            elif key == ord('p'):  # Переключение отображения траекторий
+                show_trajectories = not show_trajectories
+                print(f"\nТраектории: {'ВКЛЮЧЕНЫ' if show_trajectories else 'ВЫКЛЮЧЕНЫ'}")
+            elif key == ord('s'):  # Сохранение кадра
+                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                filename = f"frame_{frame_count}_{timestamp}.jpg"
+                cv2.imwrite(filename, display_image)
+                print(f"\nКадр сохранен: {filename}")
+            elif key == ord('+'):  # Увеличить порог уверенности
+                model.conf = min(0.9, model.conf + 0.05)
+                print(f"\nПорог уверенности увеличен до: {model.conf:.2f}")
+            elif key == ord('-'):  # Уменьшить порог уверенности
+                model.conf = max(0.1, model.conf - 0.05)
+                print(f"\nПорог уверенности уменьшен до: {model.conf:.2f}")
+            elif key == ord(' '):  # Пауза
+                print("\nПауза. Нажмите ПРОБЕЛ для продолжения...")
+                paused = True
+                while paused and running:
+                    # Проверяем не закрыто ли окно во время паузы
+                    if is_window_closed(window_name):
+                        print("\nОкно закрыто во время паузы")
+                        paused = False
+                        running = False
+                        break
+                    
+                    key_pause = cv2.waitKey(30) & 0xFF
+                    if key_pause == ord(' '):  # Снова пробел для продолжения
+                        print("Продолжение...")
+                        paused = False
+                    elif key_pause == ord('s'):  # Сохранить кадр в паузе
+                        timestamp = time.strftime("%Y%m%d_%H%M%S")
+                        filename = f"frame_{frame_count}_paused_{timestamp}.jpg"
+                        cv2.imwrite(filename, display_image)
+                        print(f"Кадр сохранен: {filename}")
+                    elif key_pause == 27 or key_pause == ord('q'):  # Выход из паузы
+                        print("\nВыход из паузы с завершением программы")
+                        paused = False
+                        running = False
+                        break
             
-            # Прогресс
-            if processed_count % 10 == 0:
-                print(f"Кадр {frame_count} | FPS: {current_fps:.1f} | Машин: {cars_count} | Людей: {people_count}", end='\r')
-    
+            # Прогресс каждые 30 кадров
+            if frame_count % 30 == 0:
+                avg_fps = total_fps / 30
+                print(f"Кадр: {frame_count} | Объектов: {len(preds)} | FPS: {avg_fps:.1f}", end='\r')
+                total_fps = 0
+                
     except KeyboardInterrupt:
-        print("\n\n⚠️  Прервано (Ctrl+C)")
+        print("\n\nПрервано пользователем (Ctrl+C)")
+    except Exception as e:
+        print(f"\n\nПроизошла ошибка: {e}")
+        import traceback
+        traceback.print_exc()
     
     finally:
+        # Всегда освобождаем ресурсы
+        print("\n" + "=" * 70)
+        print("ЗАВЕРШЕНИЕ РАБОТЫ...")
+        print("=" * 70)
+        
+        # Закрываем видео
         cap.release()
-        out.release()
+        
+        # Закрываем все окна OpenCV
         cv2.destroyAllWindows()
         
-        print("\n" + "=" * 70)
-        print("СТАТИСТИКА ОБРАБОТКИ")
-        print("=" * 70)
-        print(f"Всего кадров: {frame_count}")
-        print(f"Обработано кадров: {processed_count}")
-        print(f"Общее время: {time.time() - start_time:.1f} сек")
-        print(f"Средний FPS обработки: {processed_count/(time.time() - start_time):.1f}")
-        print(f"Результат сохранен в: output_result.mp4")
+        # Дополнительный вызов для гарантии закрытия окон
+        for i in range(5):
+            cv2.waitKey(1)
+        
+        print(f"Всего обработано кадров: {frame_count}")
+        print("Программа завершена.")
         print("=" * 70)
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

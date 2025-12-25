@@ -1,0 +1,3 @@
+https://raw.githubusercontent.com/pjreddie/darknet/master/cfg/yolov3.cfg
+https://raw.githubusercontent.com/pjreddie/darknet/master/data/coco.names
+https://github.com/shadiakiki1986/yolov3.weights/releases/download/3.0.1/yolov3.weights
