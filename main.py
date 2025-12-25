@@ -6,11 +6,8 @@ import argparse
 import os
 import time
 import signal
-
-# Импортируем оригинальный трекер из sort.py
 from sort import Sort
 
-# ==================== ФУНКЦИЯ ДЛЯ ЦВЕТОВ ====================
 def get_color(obj_id, alpha=1.0):
     """
     Генерация цветов на основе ID объекта
@@ -20,7 +17,6 @@ def get_color(obj_id, alpha=1.0):
     color = np.random.rand(3) * 255
     return tuple([int(c * alpha) for c in color])
 
-# ==================== ФУНКЦИЯ ДЛЯ ПРОВЕРКИ ОКНА ====================
 def is_window_closed(window_name):
     """
     Проверяет, закрыто ли окно OpenCV
@@ -39,13 +35,11 @@ def is_window_closed(window_name):
         except:
             return True
 
-# ==================== ОБРАБОТЧИК СИГНАЛОВ ====================
 def signal_handler(sig, frame):
-    """Обработчик Ctrl+C для graceful shutdown"""
+    # Ctrl+C shutdown
     print('\n\nПолучен сигнал Ctrl+C, завершение работы...')
     sys.exit(0)
 
-# ==================== МОДЕЛЬ YOLOv3 ====================
 class YOLOv3Model:
     """Обертка для YOLOv3 в стиле PyTorch модели"""
     def __init__(self, config_path="data/yolov3.cfg", 
@@ -66,11 +60,11 @@ class YOLOv3Model:
         self.output_layers = [layer_names[i - 1] for i in self.net.getUnconnectedOutLayers()]
         
         # Параметры модели
-        self.conf = 0.5  # Порог уверенности
-        self.iou = 0.4   # IoU для NMS
+        self.conf = 0.5  # Порог conf
+        self.iou = 0.4   # IoU
         self.names = {i: name for i, name in enumerate(self.classes)}
         
-        print(f"✓ YOLOv3 модель загружена ({len(self.classes)} классов)")
+        print(f"YOLOv3 модель загружена ({len(self.classes)} классов)")
     
     def to(self, device):
         """Для совместимости с PyTorch API"""
@@ -154,7 +148,6 @@ class YOLOv3Model:
         
         return Results([pred_tensor], image)
 
-# ==================== КЛАСС ДЛЯ УПРАВЛЕНИЯ ТРАЕКТОРИЯМИ ====================
 class TrajectoryManager:
     """Управляет треками и их траекториями для отрисовки шлейфа"""
     def __init__(self, max_history=50, fade_frames=30):
@@ -280,20 +273,20 @@ class TrajectoryManager:
         return image
     
     def get_active_count(self):
-        """Возвращает количество активных треков"""
+        # Возвращает количество активных треков
         return sum(1 for data in self.trajectories.values() if data['active'])
     
     def get_total_count(self):
-        """Возвращает общее количество треков (активных + неактивных)"""
+        # Возвращает общее количество треков (активных + неактивных)
         return len(self.trajectories)
 
-# ==================== ОСНОВНАЯ ФУНКЦИЯ ====================
+
 def main():
     # Регистрация обработчика Ctrl+C
     signal.signal(signal.SIGINT, signal_handler)
     
     # Парсинг аргументов командной строки
-    parser = argparse.ArgumentParser(description='YOLOv3 Object Detection with SORT Tracking')
+    parser = argparse.ArgumentParser(description='YOLOv3')
     
     # 1. Устройство захвата (путь до видео, номер камеры, ip адрес)
     parser.add_argument('--source', type=str, 
@@ -352,11 +345,7 @@ def main():
         model = model.to(device)
         model.eval()
     except Exception as e:
-        print(f"✗ Ошибка загрузки модели: {e}")
-        print("Убедитесь, что файлы YOLOv3 находятся в папке 'data/':")
-        print("  - yolov3.cfg")
-        print("  - yolov3.weights")
-        print("  - coco.names")
+        print(f"Ошибка загрузки модели: {e}")
         return
     
     # Определяем тип источника
@@ -398,7 +387,7 @@ def main():
     show_trajectories = args.show_trajectories
     
     # Создание окна для отображения
-    window_name = 'YOLOv3 Object Tracking'
+    window_name = 'YOLOv3'
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(window_name, min(1280, width), min(720, height))
     
@@ -419,13 +408,11 @@ def main():
     
     try:
         while running:
-            # ПРОВЕРКА 1: Окно закрыто крестиком?
             if is_window_closed(window_name):
                 print("\nОкно закрыто пользователем (крестик)")
                 running = False
                 break
             
-            # ПРОВЕРКА 2: Чтение кадра
             ret, frame = cap.read()
             if not ret:
                 print("\nКонец видео или ошибка чтения кадра")
@@ -451,9 +438,6 @@ def main():
             # Трекинг с оригинальным SORT
             tracking_time = 0
             if use_tracker and len(preds) > 0:
-                # SORT ожидает формат: [[x1, y1, x2, y2, score, class], ...]
-                # Наши данные уже в этом формате
-                
                 start_track = time.time()
                 tracked_preds = mot_tracker.update(preds)
                 tracking_time = time.time() - start_track
@@ -489,7 +473,7 @@ def main():
             # Конвертация обратно в BGR для отображения
             display_image = cv2.cvtColor(results.ims[0], cv2.COLOR_RGB2BGR)
             
-            # Рисуем траектории (шлейфы)
+            # Рисуем траектории
             if use_tracker and show_trajectories:
                 display_image = trajectory_manager.draw_trajectories(display_image, thickness=6)
             
@@ -589,7 +573,6 @@ def main():
             # Отображение изображения
             cv2.imshow(window_name, display_image)
             
-            # ПРОВЕРКА 3: Обработка клавиш (30 мс для лучшей обработки событий окна)
             key = cv2.waitKey(30) & 0xFF
             
             if key == ord('q') or key == 27:  # 'q' или ESC
