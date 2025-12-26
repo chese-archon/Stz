@@ -41,7 +41,6 @@ def signal_handler(sig, frame):
     sys.exit(0)
 
 class YOLOv3Model:
-    """Обертка для YOLOv3 в стиле PyTorch модели"""
     def __init__(self, config_path="data/yolov3.cfg", 
                  weights_path="data/yolov3.weights",
                  classes_path="data/coco.names"):
@@ -600,10 +599,10 @@ def main():
                 filename = f"frame_{frame_count}_{timestamp}.jpg"
                 cv2.imwrite(filename, display_image)
                 print(f"\nКадр сохранен: {filename}")
-            elif key == ord('+'):  # Увеличить порог уверенности
+            elif key == ord('d'):  # elif key == ord('+'):  # Увеличить порог уверенности
                 model.conf = min(0.9, model.conf + 0.05)
                 print(f"\nПорог уверенности увеличен до: {model.conf:.2f}")
-            elif key == ord('-'):  # Уменьшить порог уверенности
+            elif key == ord('a'):  # elif key == ord('-'):  # Уменьшить порог уверенности
                 model.conf = max(0.1, model.conf - 0.05)
                 print(f"\nПорог уверенности уменьшен до: {model.conf:.2f}")
             elif key == ord(' '):  # Пауза
@@ -639,14 +638,13 @@ def main():
                 total_fps = 0
                 
     except KeyboardInterrupt:
-        print("\n\nПрервано пользователем (Ctrl+C)")
+        print("\n\nПрервано пользователем") # ctrl+c
     except Exception as e:
         print(f"\n\nПроизошла ошибка: {e}")
         import traceback
         traceback.print_exc()
     
     finally:
-        # Всегда освобождаем ресурсы
         print("\n" + "=" * 70)
         print("ЗАВЕРШЕНИЕ РАБОТЫ...")
         print("=" * 70)
@@ -656,10 +654,6 @@ def main():
         
         # Закрываем все окна OpenCV
         cv2.destroyAllWindows()
-        
-        # Дополнительный вызов для гарантии закрытия окон
-        for i in range(5):
-            cv2.waitKey(1)
         
         print(f"Всего обработано кадров: {frame_count}")
         print("Программа завершена.")
