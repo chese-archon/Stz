@@ -108,6 +108,8 @@ def main():
                 cv2.rectangle(image, (x1, y1), (x2, y2), clr, 4)
                 cv2.putText(image, f"{class_names[cls]} ID:{track_id}", 
                            (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 3, clr, 5)
+                # cv2.putText(image, f"{class_names[cls]} ID:{track_id}", 
+                #             (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 1, clr, 2)
                 
                 # track
                 if track_id in track_history:
@@ -133,8 +135,10 @@ def main():
         # default inf
         info_text = f"Conf: {round(model.conf, 2)} | Tracks: {len(track_history)} | Tracker: {'ON' if use_tracker else 'OFF'} | In memory {mot_tracker.max_age}"
         cv2.putText(image, info_text, (80, 150), cv2.FONT_HERSHEY_SIMPLEX, 4, (0, 255, 0), 4)
+        #cv2.putText(image, info_text, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
         
         resized_image = cv2.resize(image, (800, 600))
+        #resized_image = cv2.resize(image, (1800, 1900))
         cv2.imshow("YOLOv3", resized_image)
         
         # react on buttons
